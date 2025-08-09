@@ -5,5 +5,10 @@
 
 int main() {
     Proxy p = Proxy(SRC_CLIENT, DST_CLIENT);
+    try {
+        p.startProxy();
+    } catch () {
+
+    }
     return 0;
 }
