@@ -24,6 +24,9 @@
 
 #define BUFFER_SIZE 65543 // 0xFFFF + header (8 bytes)
 #define MAX_EGRESS 100
+#define MAX_UINT_16 0xFFFF
+#define SENS_FIRST_16 0xCC40
+#define CKSM_REPLACEMENT_VAL 0xCCCC
 
 Proxy::Proxy(int ingress_port, int egress_port) : ingress_port(ingress_port), egress_port(egress_port) {}
 
@@ -104,6 +107,45 @@ int Proxy::transmitter(std::byte* data, ssize_t len) {
     return 0;
 }
 
+int Proxy::validateChecksum(uint16_t real_checksum, uint16_t length_field, std::byte* data) {
+    uint32_t sum = 0;
+    sum += SENS_FIRST_16;
+    sum += length_field;
+    if (sum > MAX_UINT_16) {
+        sum = (sum & MAX_UINT_16) + 1;
+    }
+
+    sum += CKSM_REPLACEMENT_VAL;
+    if (sum > MAX_UINT_16) {
+        sum = (sum & MAX_UINT_16) + 1;
+    }
+
+    ssize_t len = length_field + 8;
+
+    // compute over body of packet
+    for (int i = 6; i < len; i+=2) {
+        uint16_t val;
+        memcpy(&val, &data[i], sizeof(val));
+        sum += ntohs(val);
+        if (sum > MAX_UINT_16) {
+            sum = (sum & MAX_UINT_16) + 1;
+        }
+    }
+
+    if (length_field % 2 != 0) {
+        uint16_t last_byte = static_cast<unsigned char>(data[len - 1]) << 8;
+        sum += last_byte;
+        if (sum > MAX_UINT_16) sum = (sum & MAX_UINT_16) + 1;
+    }
+
+    uint16_t computed_checksum = static_cast<uint16_t>(~sum & MAX_UINT_16);
+    if (computed_checksum != real_checksum) {
+        return -1;
+    }
+    
+    return 0;
+}
+
 // validates the data before calling transmitter
 int Proxy::middleware(std::byte* data, ssize_t len) {
     // minimum size check
@@ -125,6 +167,18 @@ int Proxy::middleware(std::byte* data, ssize_t len) {
     if (length_field != (len - 8)) {
         printf("package dropped due to length mismatch\n");
         return 0; // maybe change the return later? or could throw err
+    }
+
+    // determine if it is sensitive
+    if(static_cast<unsigned char>(data[1]) & 0x40) { // separate to new function
+        uint16_t real_checksum;
+        memcpy(&real_checksum, &data[4], sizeof(real_checksum));
+        real_checksum = ntohs(real_checksum);
+        int result = validateChecksum(real_checksum, length_field, data);
+        if (result < 0) {
+            printf("package dropped due to mismatched checksum\n");
+            return 0;
+        }
     }
 
     transmitter(data, len);
