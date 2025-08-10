@@ -1,3 +1,9 @@
 # proxy-challenge
 
-To build run: `make` then `./proxy`
+To build run: 
+```
+mkdir build
+cd build
+cmake ..
+make
+```

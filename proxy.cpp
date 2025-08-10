@@ -9,146 +9,137 @@
 // man accept(): creates a new connected socket and returns a new file descriptor referring to the socket
 
 #include "proxy.h"
+#include "ctmp.h"
 #include <sys/socket.h>
 #include <iostream>
 #include <stdexcept>
 #include <unistd.h>   
 #include <arpa/inet.h> 
+#include <thread>
+#include <vector>
+#include <mutex>
+#include <string.h>
+#include <cstddef>
 
-#define BUFFER_SIZE 4096
+#define BUFFER_SIZE 65543 // 0xFFFF + header (8 bytes)
 #define MAX_EGRESS 25
-
-class Proxy {
-    public:
-        Proxy(int ingress_port, int egress_port);
-        int startProxy();
-        int stopProxy();
-        ~Proxy();
-    private:
-        int addDestClient();
-        int egress_socket; // multiple clients
-        int ingress_socket; // only one client
-        int ingress_port;
-        int egress_port;
-        sockaddr_in ingress_sockaddr;
-        sockaddr_in egress_sockaddr;
-};
 
 Proxy::Proxy(int ingress_port, int egress_port) : ingress_port(ingress_port), egress_port(egress_port) {}
 
-int Proxy::startProxy() {
-    
-    ingress_socket = socket(AF_INET, SOCK_STREAM, 0);
-    if (ingress_socket < 0) {
+int Proxy::createSocket(int port, int queue_size, sockaddr_in* sockaddr) {
+    int socket_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (socket_fd < 0) {
         throw std::runtime_error("ingress socket failed");
     }
     
-    // listen on ingress port for 1 source client
-    ingress_sockaddr = {};
-    ingress_sockaddr.sin_family = AF_INET;
-    ingress_sockaddr.sin_port = htons(ingress_port); 
-    if (bind(ingress_socket, (struct sockaddr*)&ingress_sockaddr, sizeof(ingress_sockaddr)) < 0) {
-        throw std::runtime_error("failed to bind on ingress socket");
+    *sockaddr = {};
+    sockaddr->sin_family = AF_INET;
+    sockaddr->sin_port = htons(port);
+    sockaddr->sin_addr.s_addr = INADDR_ANY;
+    if (bind(socket_fd, (struct sockaddr*)sockaddr, sizeof(*sockaddr)) < 0) {
+        throw std::runtime_error("failed to bind on socket");
     }
     
-    if (listen(ingress_socket, 1) < 0) {
-        throw std::runtime_error("failed to listen on ingress socket");
+    if (listen(socket_fd, queue_size) < 0) {
+        throw std::runtime_error("failed to listen on socket");
+    }
+
+    return socket_fd;
+}
+
+int Proxy::addDestClient() {
+   while(1) {
+        int fd = accept(egress_socket, NULL, NULL);
+        if (fd >= 0) { // TODO: check this matches the correct return vals
+            std::lock_guard<std::mutex> lock(egress_mutex);
+            egress_clients.push_back(fd);
+            printf("egress client connected, total: %zu\n", egress_clients.size());
+        }
+   }
+}
+
+int Proxy::addSrcClient(int fd) {
+    std::byte buffer[BUFFER_SIZE];
+    while(1) {
+        ssize_t n = recv(fd, buffer, sizeof(buffer), 0);
+        if (n < 0) {
+            // error occured
+            close(fd);
+            throw std::runtime_error("error receiving data\n"); // remove when making it production
+        } else if (n == 0) {
+            // client closed connection
+            close(fd);
+            break;
+        }
+
+        middleware(buffer, n);
+    }
+
+    return 0;
+}
+
+int Proxy::transmitter(std::byte* data, size_t len) {
+    std::lock_guard<std::mutex> lock(egress_mutex);
+    for (auto it = egress_clients.begin(); it != egress_clients.end();) {
+        ssize_t sent = send(*it, data, len, 0);
+        if (sent <= 0) { // TODO: handle proper ret vals
+            close(*it);
+            it = egress_clients.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    return 0;
+}
+
+// validates the data before calling transmitter
+int Proxy::middleware(std::byte* data, size_t len) {
+    // minimum size check
+    if (len < HEADER_SIZE) {
+        printf("package dropped due to being too small\n");
+        return 0; // maybe change the return later?
+    }
+
+    // validate magic num
+    if (data[0] != std::byte{MAGIC_NUM}) {
+        printf("package dropped due to invalid magic num\n");
+        return 0; // maybe change the return later?
+    }
+
+    // validate length
+    uint16_t length_field;
+    memcpy(&length_field, &data[2], sizeof(length_field));
+    length_field = ntohs(length_field);
+    if (length_field != (len - 8)) {
+        printf("package dropped due to length mismatch\n");
+        return 0; // maybe change the return later? or could throw err
+    }
+
+    transmitter(data, len);
+}
+
+int Proxy::startProxy() {
+    try {
+        ingress_socket = createSocket(ingress_port, 1, &ingress_sockaddr);
+        printf("Proxy listening on 127.0.0.1:%d", ingress_port);
+        egress_socket = createSocket(egress_port, MAX_EGRESS, &egress_sockaddr);
+        printf("Proxy listening on 127.0.0.1:%d", egress_port);
+    } catch(const std::runtime_error& e) {
+        throw e; // pointless
+    }
+
+    std::thread egress_thread(&Proxy::addDestClient, this);
+    egress_thread.detach();
+
+    while (1)
+    {
+        int fd = accept(ingress_socket, NULL, NULL);
+        if (fd >=0) { // TODO: check return values
+            addSrcClient(fd);
+        }
     }
     
-    printf("Proxy listening on 127.0.0.1:%d", ingress_port);
-    
-    egress_socket = socket(AF_INET, SOCK_STREAM, 0);
-    if (egress_socket < 0) {
-        throw std::runtime_error("egress socket failed");
-    }
-    
-    // accept connections for dest clients
-    egress_sockaddr = {};
-    egress_sockaddr.sin_family = AF_INET;
-    egress_sockaddr.sin_port = htons(ingress_port); 
-    if (bind(egress_socket, (struct sockaddr*)&egress_sockaddr, sizeof(egress_sockaddr)) < 0) {
-        throw std::runtime_error("failed to bind on ingress socket");
-    }
-
-    if (listen(ingress_socket, 1) < 0) {
-        throw std::runtime_error("failed to listen on egress socket");
-    }
-    
-    printf("Proxy listening on 127.0.0.1:%d", egress_port);
-    fd_set readfds;
-    char buffer[BUFFER_SIZE];
-    int outbounds[MAX_EGRESS];
-    int egress_connections = 0;
-    struct sockaddr_in client_addr;
-    socklen_t client_len = sizeof(client_addr);
-    // handle connection requests
-    while (1) { // TODO: move to separate function
-        FD_ZERO(&readfds);
-        FD_SET(ingress_socket, &readfds);
-        FD_SET(egress_socket, &readfds);
-        int maxfd = (ingress_socket > egress_socket ? ingress_socket : egress_socket); 
-
-        if (ingress_socket != -1) {
-            FD_SET(ingress_socket, &readfds);
-            if (ingress_socket > maxfd) maxfd = ingress_socket;
-        }
-
-        for (int i = 0; i < egress_connections; i++) {
-            FD_SET(outbounds[i], &readfds);
-            if (outbounds[i] > maxfd) maxfd = outbounds[i];
-        }
-
-        if (select(maxfd + 1, &readfds, NULL, NULL, NULL) < 0) {
-            throw std::runtime_error("failed accepting connection");
-        }
-
-        if (FD_ISSET(ingress_socket, &readfds)) {
-            int new_fd = accept(ingress_socket, (struct sockaddr*)&ingress_sockaddr, &client_len);
-            if (new_fd < 0) {
-                throw std::runtime_error("failed to accept ingress client");
-            }
-
-            if (ingress_socket == -1) {
-                ingress_socket = new_fd;
-            } else {
-                printf("more than 1 simultatneous ingress connections attempted.\n");
-                close(new_fd);
-            }
-        }
-
-        if (FD_ISSET(egress_socket, &readfds)) {
-            int new_fd = accept(egress_socket, (struct sockaddr*)&client_addr, &client_len);
-            if (new_fd < 0) {
-                throw std::runtime_error("failed to accept egress client");
-            }
-
-            if (egress_connections < MAX_EGRESS) {
-                outbounds[egress_connections++] = new_fd;
-            } else {
-                printf("more than %d simultatneous egress connections attempted.\n", MAX_EGRESS);
-                close(new_fd);
-            }
-        }
-
-        if (ingress_socket != -1 && FD_ISSET(ingress_socket, &readfds)) {
-            ssize_t n = read(ingress_socket, buffer, sizeof(buffer));
-            printf("data received");
-            if (n <= 0) {
-                close(ingress_socket);
-                ingress_socket = -1;
-            } else {
-                for (int i = 0; i < egress_connections; i++) {
-                    if (write(outbounds[i], buffer, n) != n) {
-                        throw std::runtime_error("failed to send to outbound");
-                    }
-                }
-            }
-        }
-
-    }
-
-    close(ingress_socket);
-    close(egress_socket);
     return 0;
 }
 
