@@ -35,7 +35,7 @@ int Proxy::createSocket(int port, int queue_size, sockaddr_in* sockaddr) {
     *sockaddr = {};
     sockaddr->sin_family = AF_INET;
     sockaddr->sin_port = htons(port);
-    sockaddr->sin_addr.s_addr = INADDR_ANY;
+    sockaddr->sin_addr.s_addr =  inet_addr("127.0.0.1");
     if (bind(socket_fd, (struct sockaddr*)sockaddr, sizeof(*sockaddr)) < 0) {
         throw std::runtime_error("failed to bind on socket");
     }
@@ -43,7 +43,7 @@ int Proxy::createSocket(int port, int queue_size, sockaddr_in* sockaddr) {
     if (listen(socket_fd, queue_size) < 0) {
         throw std::runtime_error("failed to listen on socket");
     }
-
+    
     return socket_fd;
 }
 
@@ -117,21 +117,24 @@ int Proxy::middleware(std::byte* data, size_t len) {
     }
 
     transmitter(data, len);
+    return 0;
 }
 
 int Proxy::startProxy() {
     try {
         ingress_socket = createSocket(ingress_port, 1, &ingress_sockaddr);
-        printf("Proxy listening on 127.0.0.1:%d", ingress_port);
+        printf("Proxy listening on 127.0.0.1:%d\n", ingress_port);
         egress_socket = createSocket(egress_port, MAX_EGRESS, &egress_sockaddr);
-        printf("Proxy listening on 127.0.0.1:%d", egress_port);
+        printf("Proxy listening on 127.0.0.1:%d\n", egress_port);
     } catch(const std::runtime_error& e) {
         throw e; // pointless
     }
 
+    printf("creating egress thread...\n");
     std::thread egress_thread(&Proxy::addDestClient, this);
     egress_thread.detach();
-
+    
+    printf("waiting for ingress client...\n");
     while (1)
     {
         int fd = accept(ingress_socket, NULL, NULL);
