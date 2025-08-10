@@ -20,8 +20,8 @@ class Proxy {
         int addDestClient();
         int addSrcClient(int fd);
         int createSocket(int port, int queue_size, sockaddr_in* sockaddr);
-        int middleware(std::byte*, size_t len); // use byte cpp instead
-        int transmitter(std::byte*, size_t len);
+        int middleware(std::byte*, ssize_t len); // use byte cpp instead
+        int transmitter(std::byte*, ssize_t len);
         int egress_socket; // multiple clients
         int ingress_socket; // only one client
         int ingress_port;

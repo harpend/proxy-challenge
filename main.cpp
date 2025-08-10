@@ -10,8 +10,9 @@ int main() {
     try {
         printf("starting proxy...\n");
         p.startProxy();
+        printf("check\n");
     } catch (const std::runtime_error& e) {
-        std::cerr << e.what() << std::endl;
+        std::cout << e.what() << std::endl;
     }
     return 0;
 }

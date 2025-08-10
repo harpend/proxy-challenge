@@ -20,9 +20,10 @@
 #include <mutex>
 #include <string.h>
 #include <cstddef>
+#include <signal.h>
 
 #define BUFFER_SIZE 65543 // 0xFFFF + header (8 bytes)
-#define MAX_EGRESS 25
+#define MAX_EGRESS 100
 
 Proxy::Proxy(int ingress_port, int egress_port) : ingress_port(ingress_port), egress_port(egress_port) {}
 
@@ -36,6 +37,11 @@ int Proxy::createSocket(int port, int queue_size, sockaddr_in* sockaddr) {
     sockaddr->sin_family = AF_INET;
     sockaddr->sin_port = htons(port);
     sockaddr->sin_addr.s_addr =  inet_addr("127.0.0.1");
+    int opt = 1;
+    if(setsockopt(socket_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+        throw std::runtime_error("failed to set socket options");
+    }
+
     if (bind(socket_fd, (struct sockaddr*)sockaddr, sizeof(*sockaddr)) < 0) {
         throw std::runtime_error("failed to bind on socket");
     }
@@ -54,6 +60,8 @@ int Proxy::addDestClient() {
             std::lock_guard<std::mutex> lock(egress_mutex);
             egress_clients.push_back(fd);
             printf("egress client connected, total: %zu\n", egress_clients.size());
+        } else {
+            printf("accept failed due to code %d\n", fd);
         }
    }
 }
@@ -64,10 +72,12 @@ int Proxy::addSrcClient(int fd) {
         ssize_t n = recv(fd, buffer, sizeof(buffer), 0);
         if (n < 0) {
             // error occured
+            printf("recv failed due to code %ld\n", n);
             close(fd);
-            throw std::runtime_error("error receiving data\n"); // remove when making it production
+            break;
         } else if (n == 0) {
             // client closed connection
+            printf("ingress client closed connection\n");
             close(fd);
             break;
         }
@@ -78,13 +88,14 @@ int Proxy::addSrcClient(int fd) {
     return 0;
 }
 
-int Proxy::transmitter(std::byte* data, size_t len) {
+int Proxy::transmitter(std::byte* data, ssize_t len) {
     std::lock_guard<std::mutex> lock(egress_mutex);
     for (auto it = egress_clients.begin(); it != egress_clients.end();) {
         ssize_t sent = send(*it, data, len, 0);
         if (sent <= 0) { // TODO: handle proper ret vals
             close(*it);
             it = egress_clients.erase(it);
+            printf("egress client removed\n");
         } else {
             ++it;
         }
@@ -94,7 +105,7 @@ int Proxy::transmitter(std::byte* data, size_t len) {
 }
 
 // validates the data before calling transmitter
-int Proxy::middleware(std::byte* data, size_t len) {
+int Proxy::middleware(std::byte* data, ssize_t len) {
     // minimum size check
     if (len < HEADER_SIZE) {
         printf("package dropped due to being too small\n");
@@ -122,14 +133,16 @@ int Proxy::middleware(std::byte* data, size_t len) {
 
 int Proxy::startProxy() {
     try {
-        ingress_socket = createSocket(ingress_port, 1, &ingress_sockaddr);
+        ingress_socket = createSocket(ingress_port, 10, &ingress_sockaddr);
         printf("Proxy listening on 127.0.0.1:%d\n", ingress_port);
         egress_socket = createSocket(egress_port, MAX_EGRESS, &egress_sockaddr);
         printf("Proxy listening on 127.0.0.1:%d\n", egress_port);
     } catch(const std::runtime_error& e) {
+        std::cout << e.what() << std::endl;
         throw e; // pointless
     }
 
+    signal(SIGPIPE, SIG_IGN); // used to ignore sigpipe
     printf("creating egress thread...\n");
     std::thread egress_thread(&Proxy::addDestClient, this);
     egress_thread.detach();
@@ -138,8 +151,12 @@ int Proxy::startProxy() {
     while (1)
     {
         int fd = accept(ingress_socket, NULL, NULL);
-        if (fd >=0) { // TODO: check return values
-            addSrcClient(fd);
+        if (fd >=0) { // TODO: check return values 
+            printf("ingress client connected\n");
+            std::thread src_thread(&Proxy::addSrcClient, this, fd);
+            src_thread.detach();
+        } else {
+            printf("accept failed with code %d\n", fd);
         }
     }
     
