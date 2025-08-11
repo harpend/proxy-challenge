@@ -1,15 +1,4 @@
-// https://doc.lagout.org/programmation/unix/Unix%20Network%20Programming%20Volume%201.pdf
-// https://www.youtube.com/watch?v=JRTLSxGf_6w
-// NOTES TO SELF
-// man bind(): bind assigns the address specified by *sockaddr to the socket
-// man socket(): creates an endpoint for communication **assings the lowest number fd not currently open**
-// man connect(): attempts to make a connection to the socket we have binded
-// man select(): allows a program to monitor multiple file descriptors (I think this means a socket is handled as if it were a file?)
-// we probably want to spawn a new thread over using select TODO: measure overhead of threads vs sockets
-// man accept(): creates a new connected socket and returns a new file descriptor referring to the socket
-
 #include "proxy.h"
-#include "ctmp.h"
 #include <sys/socket.h>
 #include <iostream>
 #include <stdexcept>
@@ -21,15 +10,20 @@
 #include <string.h>
 #include <cstddef>
 #include <signal.h>
+#include <poll.h>
+#include <immintrin.h>
 
-#define BUFFER_SIZE 65543 // 0xFFFF + header (8 bytes)
-#define MAX_EGRESS 100
-#define MAX_UINT_16 0xFFFF
-#define SENS_FIRST_16 0xCC40
-#define CKSM_REPLACEMENT_VAL 0xCCCC
+#define DEBUG 0
+
+#if DEBUG
+  #define DEBUG_PRINT(fmt, ...) printf(fmt, ##__VA_ARGS__)
+#else
+  #define DEBUG_PRINT(fmt, ...)
+#endif
 
 Proxy::Proxy(int ingress_port, int egress_port) : ingress_port(ingress_port), egress_port(egress_port) {}
 
+// creates a sockets, then sets it to listen
 int Proxy::createSocket(int port, int queue_size, sockaddr_in* sockaddr) {
     int socket_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (socket_fd < 0) {
@@ -56,31 +50,31 @@ int Proxy::createSocket(int port, int queue_size, sockaddr_in* sockaddr) {
     return socket_fd;
 }
 
+// registers a dest client to send outbound traffic to
 int Proxy::addDestClient() {
    while(1) {
         int fd = accept(egress_socket, NULL, NULL);
         if (fd >= 0) { // TODO: check this matches the correct return vals
             std::lock_guard<std::mutex> lock(egress_mutex);
             egress_clients.push_back(fd);
-            printf("egress client connected, total: %zu\n", egress_clients.size());
+            DEBUG_PRINT("egress client connected, total: %zu\n", egress_clients.size());
         } else {
             printf("accept failed due to code %d\n", fd);
         }
    }
 }
 
+// src client handler
 int Proxy::addSrcClient(int fd) {
     std::byte buffer[BUFFER_SIZE];
     while(1) {
         ssize_t n = recv(fd, buffer, sizeof(buffer), 0);
         if (n < 0) {
-            // error occured
             printf("recv failed due to code %ld\n", n);
             close(fd);
             break;
         } else if (n == 0) {
-            // client closed connection
-            printf("ingress client closed connection\n");
+            DEBUG_PRINT("ingress client closed connection\n");
             close(fd);
             break;
         }
@@ -91,22 +85,38 @@ int Proxy::addSrcClient(int fd) {
     return 0;
 }
 
+// sends data to the egress clients
 int Proxy::transmitter(std::byte* data, ssize_t len) {
     std::lock_guard<std::mutex> lock(egress_mutex);
     for (auto it = egress_clients.begin(); it != egress_clients.end();) {
-        ssize_t sent = send(*it, data, len, 0);
-        if (sent <= 0) { // TODO: handle proper ret vals
+        // poll to see if egress client still connected if not close
+        pollfd pfd = { *it, POLLIN | POLLERR | POLLHUP | POLLNVAL, 0 };
+        int poll_ret = poll(&pfd, 1, 0);
+        if (poll_ret != 0) {
             close(*it);
             it = egress_clients.erase(it);
-            printf("egress client removed\n");
+            DEBUG_PRINT("egress client removed\n");
+            continue;
+        }
+
+        ssize_t sent = send(*it, data, len, 0);
+        if (sent <= 0) { 
+            close(*it);
+            it = egress_clients.erase(it);
+            DEBUG_PRINT("egress client removed\n");
         } else {
-            ++it;
+            DEBUG_PRINT("sent data\n");
+            it++;
         }
     }
 
     return 0;
 }
 
+// computes 1's compliment of the data
+// this is the most costly function
+// tried multithreading this, but the overhead was too high
+// came across something called AVX2 and may look into it later
 int Proxy::validateChecksum(uint16_t real_checksum, uint16_t length_field, std::byte* data) {
     uint32_t sum = 0;
     sum += SENS_FIRST_16;
@@ -122,20 +132,21 @@ int Proxy::validateChecksum(uint16_t real_checksum, uint16_t length_field, std::
 
     ssize_t len = length_field + 8;
 
-    // compute over body of packet
-    for (int i = 6; i < len; i+=2) {
-        uint16_t val;
-        memcpy(&val, &data[i], sizeof(val));
-        sum += ntohs(val);
-        if (sum > MAX_UINT_16) {
-            sum = (sum & MAX_UINT_16) + 1;
-        }
+    // convert to uint16_t* for optimisation reasons
+    const uint16_t* __restrict words = reinterpret_cast<const uint16_t*>(data + 8);
+    int word_count = (length_field) / 2;
+    for (int i = 0; i < word_count; i++) {
+        sum += ntohs(words[i]);
     }
 
-    if (length_field % 2 != 0) {
+    
+    if (length_field & 1) {
         uint16_t last_byte = static_cast<unsigned char>(data[len - 1]) << 8;
         sum += last_byte;
-        if (sum > MAX_UINT_16) sum = (sum & MAX_UINT_16) + 1;
+    }
+    
+    while (sum >> 16) {
+        sum = (sum & 0xFFFF) + (sum >> 16);
     }
 
     uint16_t computed_checksum = static_cast<uint16_t>(~sum & MAX_UINT_16);
@@ -150,14 +161,14 @@ int Proxy::validateChecksum(uint16_t real_checksum, uint16_t length_field, std::
 int Proxy::middleware(std::byte* data, ssize_t len) {
     // minimum size check
     if (len < HEADER_SIZE) {
-        printf("package dropped due to being too small\n");
-        return 0; // maybe change the return later?
+        DEBUG_PRINT("package dropped due to being too small\n");
+        return 0;
     }
 
     // validate magic num
     if (data[0] != std::byte{MAGIC_NUM}) {
-        printf("package dropped due to invalid magic num\n");
-        return 0; // maybe change the return later?
+        DEBUG_PRINT("package dropped due to invalid magic num\n");
+        return 0;
     }
 
     // validate length
@@ -165,18 +176,18 @@ int Proxy::middleware(std::byte* data, ssize_t len) {
     memcpy(&length_field, &data[2], sizeof(length_field));
     length_field = ntohs(length_field);
     if (length_field != (len - 8)) {
-        printf("package dropped due to length mismatch\n");
-        return 0; // maybe change the return later? or could throw err
+        DEBUG_PRINT("package dropped due to length mismatch\n");
+        return 0;
     }
 
     // determine if it is sensitive
-    if(static_cast<unsigned char>(data[1]) & 0x40) { // separate to new function
+    if(static_cast<unsigned char>(data[1]) & 0x40) {
         uint16_t real_checksum;
         memcpy(&real_checksum, &data[4], sizeof(real_checksum));
         real_checksum = ntohs(real_checksum);
         int result = validateChecksum(real_checksum, length_field, data);
         if (result < 0) {
-            printf("package dropped due to mismatched checksum\n");
+            DEBUG_PRINT("package dropped due to mismatched checksum\n");
             return 0;
         }
     }
@@ -185,28 +196,24 @@ int Proxy::middleware(std::byte* data, ssize_t len) {
     return 0;
 }
 
+// starts the proxy. opens sockets and spawns ingress and egress threads.
 int Proxy::startProxy() {
-    try {
-        ingress_socket = createSocket(ingress_port, 10, &ingress_sockaddr);
-        printf("Proxy listening on 127.0.0.1:%d\n", ingress_port);
-        egress_socket = createSocket(egress_port, MAX_EGRESS, &egress_sockaddr);
-        printf("Proxy listening on 127.0.0.1:%d\n", egress_port);
-    } catch(const std::runtime_error& e) {
-        std::cout << e.what() << std::endl;
-        throw e; // pointless
-    }
+    ingress_socket = createSocket(ingress_port, 10, &ingress_sockaddr);
+    printf("Proxy listening on 127.0.0.1:%d\n", ingress_port);
+    egress_socket = createSocket(egress_port, MAX_EGRESS, &egress_sockaddr);
+    printf("Proxy listening on 127.0.0.1:%d\n", egress_port);
 
-    signal(SIGPIPE, SIG_IGN); // used to ignore sigpipe
-    printf("creating egress thread...\n");
+    signal(SIGPIPE, SIG_IGN); // prevents silent crashes
+    DEBUG_PRINT("creating egress thread...\n");
     std::thread egress_thread(&Proxy::addDestClient, this);
     egress_thread.detach();
-    
-    printf("waiting for ingress client...\n");
+
+    DEBUG_PRINT("waiting for ingress client...\n");
     while (1)
     {
         int fd = accept(ingress_socket, NULL, NULL);
-        if (fd >=0) { // TODO: check return values 
-            printf("ingress client connected\n");
+        if (fd >=0) {
+            DEBUG_PRINT("ingress client connected\n");
             std::thread src_thread(&Proxy::addSrcClient, this, fd);
             src_thread.detach();
         } else {
